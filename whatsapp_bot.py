@@ -9,13 +9,14 @@ Setup:
   export VERIFY_TOKEN=...        # any string you choose; paste same in Meta webhook setup
   export LLM_PROVIDER=gemini     # or: claude
   export GEMINI_API_KEY=...      # if gemini
-  export GEMINI_MODEL=gemini-2.0-flash
+  export GEMINI_MODEL=gemini-flash-latest,gemini-3.1-flash-lite   # tried in order
   export ANTHROPIC_API_KEY=...   # if claude
   export CLAUDE_MODEL=claude-sonnet-4-6
   python whatsapp_bot.py
 Then expose it (e.g. ngrok http 5000) and set webhook URL to https://<host>/webhook
 """
 import os
+import time
 from collections import defaultdict, deque
 
 import requests
@@ -38,49 +39,78 @@ history = defaultdict(lambda: deque(maxlen=10))
 seen_ids = deque(maxlen=500)  # avoid double replies on webhook retries
 
 
+def _gemini_call(model: str, turns: list) -> str:
+    r = requests.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+        headers={"x-goog-api-key": os.environ["GEMINI_API_KEY"]},  # key kept out of the URL/logs
+        json={
+            "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+            "contents": [
+                {
+                    "role": "user" if t["role"] == "user" else "model",
+                    "parts": [{"text": t["text"]}],
+                }
+                for t in turns
+            ],
+        },
+        timeout=25,
+    )
+    r.raise_for_status()
+    return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+
+
 def ask_llm(user_id: str, text: str) -> str:
     history[user_id].append({"role": "user", "text": text})
     turns = list(history[user_id])
-
-    if PROVIDER == "claude":
-        r = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": os.environ["ANTHROPIC_API_KEY"],
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6"),
-                "max_tokens": 500,
-                "system": SYSTEM_PROMPT,
-                "messages": [
-                    {"role": t["role"], "content": t["text"]} for t in turns
-                ],
-            },
-            timeout=30,
-        )
-        r.raise_for_status()
-        reply = r.json()["content"][0]["text"]
-    else:
-        model = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
-        r = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-            params={"key": os.environ["GEMINI_API_KEY"]},
-            json={
-                "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-                "contents": [
-                    {
-                        "role": "user" if t["role"] == "user" else "model",
-                        "parts": [{"text": t["text"]}],
-                    }
-                    for t in turns
-                ],
-            },
-            timeout=30,
-        )
-        r.raise_for_status()
-        reply = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+    try:
+        if PROVIDER == "claude":
+            r = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": os.environ["ANTHROPIC_API_KEY"],
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6"),
+                    "max_tokens": 500,
+                    "system": SYSTEM_PROMPT,
+                    "messages": [
+                        {"role": t["role"], "content": t["text"]} for t in turns
+                    ],
+                },
+                timeout=30,
+            )
+            r.raise_for_status()
+            reply = r.json()["content"][0]["text"]
+        else:
+            # Try each model in order; retry briefly on overload (429/500/503)
+            models = [
+                m.strip()
+                for m in os.environ.get(
+                    "GEMINI_MODEL", "gemini-flash-latest,gemini-3.1-flash-lite"
+                ).split(",")
+                if m.strip()
+            ]
+            reply, last_err = None, None
+            for model in models:
+                for attempt in range(2):
+                    try:
+                        reply = _gemini_call(model, turns)
+                        break
+                    except requests.HTTPError as e:
+                        last_err = f"{model}: HTTP {e.response.status_code}"
+                        if e.response.status_code in (429, 500, 503):
+                            time.sleep(2)
+                            continue
+                        break  # 400/403/404: try the next model
+                if reply:
+                    break
+            if not reply:
+                raise RuntimeError(last_err or "no reply")
+    except Exception:
+        history[user_id].pop()  # don't keep an unanswered turn
+        raise
 
     history[user_id].append({"role": "assistant", "text": reply})
     return reply
